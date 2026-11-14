@@ -54,10 +54,10 @@ const ROW_SPACING = 2 * NODE_RADIUS.coordinator + NODE_GAP;
 /** Pull towards the centre that keeps separate groups of linked devices from drifting apart. */
 const GRAVITY = 0.04;
 
-/** The length a link of this quality wants: linear from MAX_LENGTH at LQI 0 down to MIN_LENGTH at 255. */
-export function idealLength(lqi: number): number {
+/** The length a link of this quality wants: linear from `maxLength` at LQI 0 down to MIN_LENGTH at 255. */
+export function idealLength(lqi: number, maxLength: number = MAX_LENGTH): number {
   const clamped = Math.min(Math.max(lqi, 0), MAX_LQI);
-  return MAX_LENGTH - ((MAX_LENGTH - MIN_LENGTH) * clamped) / MAX_LQI;
+  return maxLength - ((maxLength - MIN_LENGTH) * clamped) / MAX_LQI;
 }
 
 type Segment = readonly [Point, Point];
@@ -160,21 +160,21 @@ type SimNode = SimulationNodeDatum & { id: string };
 type SimLink = SimulationLinkDatum<SimNode> & { lqi: number };
 
 /** How far each link is from the length its quality asks for, squared and summed. Lower is a truer picture. */
-function stress(positions: ReadonlyMap<string, Point>, links: Graph["links"]): number {
+function stress(positions: ReadonlyMap<string, Point>, links: Graph["links"], maxLength: number): number {
   let total = 0;
   for (const link of links) {
     const a = positions.get(link.source);
     const b = positions.get(link.target);
     if (a !== undefined && b !== undefined) {
-      total += (Math.hypot(a.x - b.x, a.y - b.y) - idealLength(link.lqi)) ** 2;
+      total += (Math.hypot(a.x - b.x, a.y - b.y) - idealLength(link.lqi, maxLength)) ** 2;
     }
   }
   return total;
 }
 
-function simulate(graph: Graph, seed: number): Map<string, Point> {
+function simulate(graph: Graph, seed: number, maxLength: number, aspect: number): Map<string, Point> {
   const random = seededRandom(seed);
-  const spread = MAX_LENGTH * Math.sqrt(graph.nodes.length);
+  const spread = maxLength * Math.sqrt(graph.nodes.length);
   const nodes: SimNode[] = graph.nodes.map((node) => ({
     id: node.id,
     x: random() * spread,
@@ -187,14 +187,15 @@ function simulate(graph: Graph, seed: number): Map<string, Point> {
       "link",
       forceLink<SimNode, SimLink>(links)
         .id((node) => node.id)
-        .distance((link) => idealLength(link.lqi))
+        .distance((link) => idealLength(link.lqi, maxLength))
         .strength(1),
     )
     .force("charge", forceManyBody().strength(-120))
     .force("collide", forceCollide(MIN_LENGTH / 2))
     .force("centre", forceCenter(0, 0))
-    .force("gravity-x", forceX(0).strength(GRAVITY))
-    .force("gravity-y", forceY(0).strength(GRAVITY))
+    // A wide frame pulls less along x and more along y, so the network spreads to fill the room it has.
+    .force("gravity-x", forceX(0).strength(GRAVITY / aspect))
+    .force("gravity-y", forceY(0).strength(GRAVITY * aspect))
     .stop()
     .tick(TICKS);
   return new Map(nodes.map((node) => [node.id, { x: node.x ?? 0, y: node.y ?? 0 }]));
@@ -283,6 +284,7 @@ function anneal(
   seed: number,
   steps: number,
   clearance: ReadonlyMap<string, number>,
+  maxLength: number,
 ): Map<string, Point> {
   const ids = [...start.keys()];
   const slot = new Map(ids.map((id, index) => [id, index]));
@@ -298,7 +300,7 @@ function anneal(
       incident[a]?.push(ends.length);
       incident[b]?.push(ends.length);
       ends.push([a, b]);
-      ideal.push(idealLength(link.lqi));
+      ideal.push(idealLength(link.lqi, maxLength));
     }
   }
   const x = (index: number): number => xs[index] ?? 0;
@@ -370,7 +372,7 @@ function anneal(
   for (let step = 0; step < steps; step += 1) {
     const progress = step / steps;
     const temperature = hot * (cold / hot) ** progress;
-    const reach = MIN_LENGTH + MAX_LENGTH * 0.5 * (1 - progress);
+    const reach = MIN_LENGTH + maxLength * 0.5 * (1 - progress);
     const node = Math.floor(random() * ids.length);
     const [oldX, oldY] = [x(node), y(node)];
     const before = CROSSING_COST * (crossingsAt(node) + hitsAt(node)) + lengthError(node);
@@ -460,11 +462,17 @@ export interface LayoutOptions {
   restarts?: number;
   /** Annealing moves for each of the best starts; 0 turns the annealing pass off. */
   refineSteps?: number;
+  /** Width over height of the frame, so a wide frame spreads the network along x. Leave unset for a symmetric pull. */
+  aspect?: number;
+  /** The length a link of LQI 0 is drawn at; the strongest link is MIN_LENGTH. Smaller values pack the network into less room. */
+  maxLength?: number;
+  /** Draws every node with this radius instead of the radius for its kind, so a node can hold its own label. */
+  radius?: number;
 }
 
 export async function layoutGraph(graph: Graph, size: Size, options: LayoutOptions = {}): Promise<Placement> {
-  const { restarts = DEFAULT_RESTARTS, refineSteps = DEFAULT_REFINE_STEPS } = options;
-  const radii = new Map(graph.nodes.map((node) => [node.id, NODE_RADIUS[node.role]]));
+  const { restarts = DEFAULT_RESTARTS, refineSteps = DEFAULT_REFINE_STEPS, radius, maxLength = MAX_LENGTH, aspect = 1 } = options;
+  const radii = new Map(graph.nodes.map((node) => [node.id, radius ?? NODE_RADIUS[node.role]]));
   const linked = new Set(graph.links.flatMap((link) => [link.source, link.target]));
   const unlinked = graph.nodes.filter((node) => !linked.has(node.id)).map((node) => node.id);
   const meshNodes = graph.nodes.filter((node) => linked.has(node.id));
@@ -484,7 +492,7 @@ export async function layoutGraph(graph: Graph, size: Size, options: LayoutOptio
         fitted,
         edgeHits: countEdgeHits(fitted.positions, graph.links, radii),
         crossings: countCrossings(fitted.positions, graph.links),
-        stress: stress(positions, graph.links),
+        stress: stress(positions, graph.links, maxLength),
       };
     };
     type Candidate = ReturnType<typeof evaluate>;
@@ -494,13 +502,13 @@ export async function layoutGraph(graph: Graph, size: Size, options: LayoutOptio
     const candidates: Candidate[] = [];
     for (let seed = 1; seed <= restarts; seed += 1) {
       await yieldToEventLoop();
-      candidates.push(evaluate(simulate(meshGraph, seed)));
+      candidates.push(evaluate(simulate(meshGraph, seed, maxLength, aspect)));
     }
     candidates.sort(byQuality);
     for (const [rank, candidate] of candidates.slice(0, REFINED_CANDIDATES).entries()) {
       await yieldToEventLoop();
       const clearance = new Map([...radii].map(([id, radius]) => [id, (radius + EDGE_CLEARANCE) / candidate.fitted.scale]));
-      const annealed = anneal(candidate.positions, meshGraph, 1000 + rank, refineSteps, clearance);
+      const annealed = anneal(candidate.positions, meshGraph, 1000 + rank, refineSteps, clearance, maxLength);
       candidates.push(evaluate(annealed), evaluate(repair(annealed, graph.links, clearance)));
     }
     candidates.sort(byQuality);

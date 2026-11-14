@@ -3,14 +3,23 @@ import { state } from "lit/decorators.js";
 import { z } from "zod";
 import { MAX_LQI, buildGraph, deviceListSchema, lqiColour } from "./graph";
 import type { Graph, GraphNode } from "./graph";
-import { NODE_RADIUS, layoutGraph } from "./layout";
+import { LINE_HEIGHT_EM, textBoxFor, wrapName } from "./label";
+import { MIN_LENGTH, NODE_RADIUS, layoutGraph } from "./layout";
 import type { Placement } from "./layout";
 
 const configSchema = z.object({
   type: z.string(),
   title: z.string().optional(),
+  /** `selected` names only the selected device. `inside` tries nodes big enough to hold their own names and falls back to `selected` when they cannot be read. */
+  node_labels: z.enum(["selected", "inside"]).default("selected"),
 });
 type CardConfig = z.infer<typeof configSchema>;
+
+interface Plan {
+  inside: boolean;
+  /** Pixels per drawing unit the layout was planned for. */
+  k: number;
+}
 
 /** The part of Home Assistant's frontend `hass` object this card uses. */
 interface Hass {
@@ -19,9 +28,29 @@ interface Hass {
 
 const WIDTH = 640;
 const HEIGHT = 480;
+/** Radius, in drawing units, of a node that holds its own name. */
+const NODE_UNITS = NODE_RADIUS.coordinator;
+/** A node's on-screen radius is this fraction of the room each device has on average, within the bounds below. */
+const NODE_ROOM_FRACTION = 0.14;
+const NODE_PX_MIN = 24;
+const NODE_PX_MAX = 40;
+/** Text height inside a node, in pixels, and the smallest that counts as readable. */
+const NODE_FONT_PX = 11;
+const MIN_TEXT_PX = 8.5;
+/** How many short waits to allow for the card to be laid out before planning for a default width. */
+const MAX_WAIT_FRAMES = 60;
+const FRAME_WAIT_MS = 16;
+/** The weakest link is drawn this many average spacings long. */
+const LENGTH_SPACINGS = 1.6;
+/** Left and right padding of the card, which the drawing does not use. */
+const CARD_PADDING = 32;
 /** Links get thicker as the signal improves, so quality reads from width as well as colour. */
 /** Space kept clear below the card. */
 const BOTTOM_MARGIN = 12;
+/** How long the card's room must stay unchanged before the layout is planned again. */
+const RELAYOUT_DELAY_MS = 400;
+/** How much the room may change, as a fraction, before the layout is planned again. */
+const RELAYOUT_CHANGE = 0.12;
 /** The graph never shrinks below this height, even on a very short screen. */
 const MIN_GRAPH_PX = 200;
 /** Average width of one label character in screen pixels at the label's font size. */
@@ -35,6 +64,7 @@ const strokeFor = (lqi: number): number => MIN_STROKE + ((MAX_STROKE - MIN_STROK
 
 export class ZhaNetworkGraphCard extends LitElement {
   static override styles = css`
+    :host { display: block; --u: 1; }
     ha-card { padding: 16px; display: block; }
     .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .title { font-size: 1.2em; font-weight: 500; }
@@ -42,15 +72,17 @@ export class ZhaNetworkGraphCard extends LitElement {
     .graph { width: 100%; height: auto; max-height: calc(100vh - 230px); min-height: 200px; display: block; }
     .node { cursor: pointer; transition: opacity 0.15s; }
     .node:focus-visible { outline: none; }
-    .node:focus-visible circle { stroke-width: 4; }
+    .node:focus-visible circle { stroke-width: calc(var(--u) * 4px); }
     .link { transition: opacity 0.15s; }
     .graph-wrap { position: relative; }
     /* Colours come from the theme's own variables in ordinary CSS, because that is what a colour-adjusting
        extension such as Dark Reader rewrites consistently; colours copied into attributes are missed. */
-    .node-shape { stroke: var(--primary-text-color, CanvasText); }
-    .node-shape.mains { fill: var(--primary-text-color, CanvasText); }
-    .node-shape.battery { fill: var(--ha-card-background, var(--card-background-color, Canvas)); }
-    .node-shape.coordinator { fill: var(--primary-color, #03a9f4); }
+    /* --u is one screen pixel in drawing units, so outlines keep one thickness however far the drawing is scaled. */
+    /* No fill: the name sits directly on the card, whatever background and colour adjustment it has, and links stop at the ring. */
+    .node-shape { fill: transparent; pointer-events: all; stroke: var(--primary-text-color, CanvasText); stroke-width: calc(var(--u) * 2px); }
+    .node-shape.coordinator { stroke: var(--primary-color, #03a9f4); stroke-width: calc(var(--u) * 3px); }
+    .node-shape.battery { stroke-dasharray: calc(var(--u) * 4px) calc(var(--u) * 3px); }
+    .node-text { fill: var(--primary-text-color, CanvasText); pointer-events: none; text-anchor: middle; }
     .label {
       position: absolute; transform: translate(-50%, -100%); white-space: nowrap; pointer-events: none;
       font-size: 13px; line-height: 1.2; padding: 2px 6px; border-radius: 4px;
@@ -74,6 +106,8 @@ export class ZhaNetworkGraphCard extends LitElement {
   @state() private graph: Graph | undefined;
   /** Laid out once per data load, because the search for a good layout is too slow to repeat on every render. */
   @state() private placement: Placement | undefined;
+  /** Whether names are drawn inside the nodes and the pixels per drawing unit the layout was planned for. */
+  @state() private plan: Plan = { inside: false, k: 1 };
   @state() private selected: string | undefined;
   @state() private error: string | undefined;
   @state() private scanning = false;
@@ -83,6 +117,9 @@ export class ZhaNetworkGraphCard extends LitElement {
   /** The tallest the graph may be, in pixels, so the whole card fits the space left on the screen. */
   @state() private maxGraphHeight: number | undefined;
 
+  /** The frame, in pixels, the current layout was planned for. */
+  private layoutFrame = { width: 0, height: 0 };
+  private relayoutTimer: ReturnType<typeof setTimeout> | undefined;
   private resizeObserver: ResizeObserver | undefined;
   private observed: Element | undefined;
 
@@ -100,6 +137,9 @@ export class ZhaNetworkGraphCard extends LitElement {
 
   setConfig(config: unknown): void {
     this.config = configSchema.parse(config);
+    if (this.graph !== undefined) {
+      this.scheduleRelayout();
+    }
   }
 
   getCardSize(): number {
@@ -107,7 +147,7 @@ export class ZhaNetworkGraphCard extends LitElement {
   }
 
   static getStubConfig(): CardConfig {
-    return { type: "custom:zha-network-graph-card" };
+    return { type: "custom:zha-network-graph-card", node_labels: "selected" };
   }
 
   private async load(): Promise<void> {
@@ -119,16 +159,71 @@ export class ZhaNetworkGraphCard extends LitElement {
       const graph = buildGraph(devices);
       this.loadId += 1;
       const loadId = this.loadId;
-      const placement = await layoutGraph(graph, { width: WIDTH, height: HEIGHT });
+      const { placement, plan } = await this.layoutFor(graph);
       if (loadId !== this.loadId) {
         return;
       }
       this.placement = placement;
+      this.plan = plan;
       this.graph = graph;
       this.error = undefined;
     } catch (cause) {
       this.error = cause instanceof Error ? cause.message : String(cause);
     }
+  }
+
+  /**
+   * Plans the layout for the room the card has on screen. In `inside` mode every node is drawn big enough to hold its
+   * name, at a radius chosen from the room each device has; when the result still has to be drawn so small that the
+   * names would be unreadable, the card falls back to small nodes and names only the selected device.
+   */
+  private async layoutFor(graph: Graph): Promise<{ placement: Placement; plan: Plan }> {
+    const compact = async () => ({ placement: await layoutGraph(graph, { width: WIDTH, height: HEIGHT }), plan: { inside: false, k: 1 } });
+    if (this.config?.node_labels !== "inside") {
+      return compact();
+    }
+    // The card has no width until it has been laid out by the page.
+    for (let frames = 0; this.clientWidth === 0 && frames < MAX_WAIT_FRAMES; frames += 1) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, FRAME_WAIT_MS);
+      });
+    }
+    const width = Math.max(this.clientWidth - CARD_PADDING, WIDTH / 2);
+    const height = this.maxGraphHeight ?? Math.max(window.innerHeight - 300, MIN_GRAPH_PX);
+    this.layoutFrame = { width, height };
+    const roomPerDevice = Math.sqrt((width * height) / Math.max(graph.nodes.length, 1));
+    const px = Math.min(Math.max(roomPerDevice * NODE_ROOM_FRACTION, NODE_PX_MIN), NODE_PX_MAX);
+    const k = px / NODE_UNITS;
+    const size = { width: width / k, height: height / k };
+    // The longest a link may be drawn is a couple of device spacings: longer spreads the network past the frame
+    // and shrinks the nodes, and with them their names.
+    const spacing = Math.sqrt((size.width * size.height) / Math.max(graph.nodes.length, 1));
+    const placement = await layoutGraph(graph, size, {
+      radius: NODE_UNITS,
+      aspect: size.width / size.height,
+      maxLength: Math.max(MIN_LENGTH * 1.5, spacing * LENGTH_SPACINGS),
+    });
+    const textPx = (NODE_FONT_PX * Math.min(width / placement.size.width, height / placement.size.height)) / k;
+    return textPx >= MIN_TEXT_PX ? { placement, plan: { inside: true, k } } : compact();
+  }
+
+  /** Re-plans the layout once the card's room has stopped changing, so a resize does not run the search on every step. */
+  private scheduleRelayout(): void {
+    clearTimeout(this.relayoutTimer);
+    this.relayoutTimer = setTimeout(() => {
+      const graph = this.graph;
+      if (graph === undefined) {
+        return;
+      }
+      this.loadId += 1;
+      const loadId = this.loadId;
+      void this.layoutFor(graph).then(({ placement, plan }) => {
+        if (loadId === this.loadId) {
+          this.placement = placement;
+          this.plan = plan;
+        }
+      });
+    }, RELAYOUT_DELAY_MS);
   }
 
   /** Asks ZHA to re-read every device's neighbour table, which is slow on a large network. */
@@ -198,11 +293,21 @@ export class ZhaNetworkGraphCard extends LitElement {
     if (limit !== this.maxGraphHeight) {
       this.maxGraphHeight = limit;
     }
+    const planned = this.layoutFrame;
+    const width = Math.max(this.clientWidth - CARD_PADDING, WIDTH / 2);
+    if (
+      this.config?.node_labels === "inside" &&
+      this.graph !== undefined &&
+      (Math.abs(width - planned.width) > planned.width * RELAYOUT_CHANGE || Math.abs(limit - planned.height) > planned.height * RELAYOUT_CHANGE)
+    ) {
+      this.scheduleRelayout();
+    }
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.resizeObserver?.disconnect();
+    clearTimeout(this.relayoutTimer);
     this.observed = undefined;
     window.removeEventListener("resize", this.onWindowResize);
   }
@@ -237,18 +342,22 @@ export class ZhaNetworkGraphCard extends LitElement {
       }
     }
     const named = graph.nodes.filter((node) => node.id === focus);
+    const byId = new Map(graph.nodes.map((node) => [node.id, node]));
     return html`
       <div class="graph-wrap">
-      <svg class="graph" style=${this.maxGraphHeight === undefined ? nothing : `max-height: ${String(this.maxGraphHeight)}px`} viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
+      <svg class="graph" style=${`--u: ${String(1 / Math.max(this.frame.scale, 0.05))};${this.maxGraphHeight === undefined ? "" : ` max-height: ${String(this.maxGraphHeight)}px`}`} viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
         ${graph.links.map((link) => {
           const from = positions.get(link.source);
           const to = positions.get(link.target);
-          if (from === undefined || to === undefined) {
+          const fromNode = byId.get(link.source);
+          const toNode = byId.get(link.target);
+          if (from === undefined || to === undefined || fromNode === undefined || toNode === undefined) {
             return nothing;
           }
+          const [start, end] = this.rimToRim(from, this.radiusOf(fromNode), to, this.radiusOf(toNode));
           const touching = link.source === focus || link.target === focus;
-          return svg`<line class="link" x1=${from.x} y1=${from.y} x2=${to.x} y2=${to.y}
-            stroke=${lqiColour(link.lqi)} stroke-width=${strokeFor(link.lqi)} stroke-linecap="round"
+          return svg`<line class="link" x1=${start.x} y1=${start.y} x2=${end.x} y2=${end.y}
+            stroke=${lqiColour(link.lqi)} style=${`stroke-width: calc(var(--u) * ${String(strokeFor(link.lqi))}px)`} stroke-linecap="round"
             opacity=${focus === undefined || touching ? 1 : FADED}>
             <title>LQI ${Math.round(link.lqi)}</title>
           </line>`;
@@ -264,8 +373,9 @@ export class ZhaNetworkGraphCard extends LitElement {
               @click=${(event: Event) => { event.stopPropagation(); this.select(node.id); }}
               @keydown=${(event: KeyboardEvent) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); this.select(node.id); } }}>
             <circle class=${`node-shape ${node.role === "coordinator" ? "coordinator" : node.battery ? "battery" : "mains"}`}
-              cx=${at.x} cy=${at.y} r=${NODE_RADIUS[node.role]}
-              stroke-width=${node.id === focus ? 4 : 2} />
+              cx=${at.x} cy=${at.y} r=${this.radiusOf(node)}
+              style=${node.id === focus ? "stroke-width: calc(var(--u) * 4px)" : nothing} />
+            ${this.plan.inside ? this.renderNodeText(node.name, at) : nothing}
             <title>${node.name}</title>
           </g>`;
         })}
@@ -278,13 +388,45 @@ export class ZhaNetworkGraphCard extends LitElement {
     `;
   }
 
+  /** The two ends of a link, moved from the node centres out to the rims so a link never runs through a node's name. */
+  private rimToRim(a: { x: number; y: number }, ra: number, b: { x: number; y: number }, rb: number): [{ x: number; y: number }, { x: number; y: number }] {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const length = Math.hypot(dx, dy);
+    if (length <= ra + rb) {
+      return [a, b];
+    }
+    const ux = dx / length;
+    const uy = dy / length;
+    return [
+      { x: a.x + ux * ra, y: a.y + uy * ra },
+      { x: b.x - ux * rb, y: b.y - uy * rb },
+    ];
+  }
+
+  /** Radius in drawing units: one size when names are inside, otherwise by kind of device. */
+  private radiusOf(node: GraphNode): number {
+    return this.plan.inside ? NODE_UNITS : NODE_RADIUS[node.role];
+  }
+
+  /** The device name wrapped inside its node, vertically centred. */
+  private renderNodeText(name: string, at: { x: number; y: number }) {
+    const fontUnits = NODE_FONT_PX / this.plan.k;
+    const lines = wrapName(name, textBoxFor(NODE_UNITS, fontUnits));
+    const lineHeight = fontUnits * LINE_HEIGHT_EM;
+    const first = at.y - ((lines.length - 1) * lineHeight) / 2;
+    return svg`<text class="node-text" font-size=${fontUnits}>${lines.map(
+      (line, index) => svg`<tspan x=${at.x} y=${first + index * lineHeight} dominant-baseline="central">${line}</tspan>`,
+    )}</text>`;
+  }
+
   /** A name tag above the node, an HTML element so it is themed like the rest of the card, kept inside the frame. */
   private renderLabel(node: GraphNode, at: { x: number; y: number }) {
     const { scale, offsetX, offsetY, width } = this.frame;
     // Half the tag's width, estimated from the name, so the tag can be kept inside the frame before it is measured.
     const half = (node.name.length * LABEL_CHAR_PX + 14) / 2;
     const left = Math.min(Math.max(offsetX + at.x * scale, half), Math.max(width - half, half));
-    const top = Math.max(offsetY + (at.y - NODE_RADIUS[node.role]) * scale - 4, 20);
+    const top = Math.max(offsetY + (at.y - this.radiusOf(node)) * scale - 4, 20);
     return html`<div class="label" style=${`left: ${String(left)}px; top: ${String(top)}px`}>${node.name}</div>`;
   }
 
@@ -292,15 +434,15 @@ export class ZhaNetworkGraphCard extends LitElement {
     const key = (role: GraphNode["role"], battery: boolean, label: string) => html`
       <span class="legend-item">
         <svg width="18" height="18" viewBox="-9 -9 18 18" aria-hidden="true">
-          <circle class=${`node-shape ${role === "coordinator" ? "coordinator" : battery ? "battery" : "mains"}`} r=${Math.min(NODE_RADIUS[role], 7)} stroke-width="2" />
+          <circle class=${`node-shape ${role === "coordinator" ? "coordinator" : battery ? "battery" : "mains"}`} r="6.5" stroke-width="2" />
         </svg>${label}
       </span>`;
     return html`
       <div class="legend">
         <span class="legend-item">Weak <span class="scale" role="img" aria-label="Link quality from weak, red, to strong, green"></span> Strong</span>
         ${key("coordinator", false, "Coordinator")}
-        ${key("router", false, "Router")}
-        ${key("end-device", true, "Battery device")}
+        ${key("router", false, "Mains powered")}
+        ${key("end-device", true, "Battery powered")}
         <span class="legend-item">Dimmed: unavailable</span>
       </div>
     `;
