@@ -20,12 +20,34 @@ interface Hass {
 const WIDTH = 640;
 const HEIGHT = 480;
 /** Links get thicker as the signal improves, so quality reads from width as well as colour. */
+/** Space kept clear below the card. */
+const BOTTOM_MARGIN = 12;
+/** The graph never shrinks below this height, even on a very short screen. */
+const MIN_GRAPH_PX = 200;
 /** Label text height in screen pixels. */
 const LABEL_PX = 13;
 const MIN_STROKE = 1;
 const MAX_STROKE = 3.5;
 /** What an unselected part of the drawing fades to while a device is selected. */
 const FADED = 0.18;
+
+/**
+ * The first opaque background colour at or above `start`, walking out through shadow roots, or a dark
+ * default. A card in a themed dashboard is often transparent and the colour comes from a parent.
+ */
+function resolvedBackground(start: Element): string {
+  let node: Element | null = start;
+  while (node !== null) {
+    const colour = getComputedStyle(node).backgroundColor;
+    const alpha = /^rgba\(.*,\s*([\d.]+)\)$/.exec(colour)?.[1];
+    if (colour !== "transparent" && (alpha === undefined ? colour.startsWith("rgb") : Number(alpha) > 0.9)) {
+      return colour;
+    }
+    const root: Node = node.getRootNode();
+    node = node.parentElement ?? (root instanceof ShadowRoot ? root.host : null);
+  }
+  return "#1c1c1c";
+}
 
 const strokeFor = (lqi: number): number => MIN_STROKE + ((MAX_STROKE - MIN_STROKE) * Math.min(Math.max(lqi, 0), MAX_LQI)) / MAX_LQI;
 
@@ -35,17 +57,18 @@ export class ZhaNetworkGraphCard extends LitElement {
     .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .title { font-size: 1.2em; font-weight: 500; }
     /* The graph shrinks to fit the screen, keeping its proportions, so the legend and details stay in view. */
-    .graph { width: 100%; height: auto; max-height: calc(100vh - 230px); min-height: 240px; display: block; }
+    .graph { width: 100%; height: auto; max-height: calc(100vh - 230px); min-height: 200px; display: block; }
     .node { cursor: pointer; transition: opacity 0.15s; }
     .node:focus-visible { outline: none; }
     .node:focus-visible circle { stroke-width: 4; }
     .link { transition: opacity 0.15s; }
-    .label-box { fill: var(--card-background-color, #fff); stroke: var(--divider-color, currentColor); opacity: 0.96; pointer-events: none; }
-    .label { fill: var(--primary-text-color, currentColor); pointer-events: none; }
+    .label-box { fill: var(--zgc-bg); stroke: var(--zgc-fg); stroke-opacity: 0.5; pointer-events: none; }
+    .label { fill: var(--zgc-fg); pointer-events: none; }
     .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; margin-top: 8px; font-size: 0.85em; color: var(--secondary-text-color, inherit); }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; }
     .scale { width: 90px; height: 8px; border-radius: 4px; background: linear-gradient(to right, hsl(0 75% 45%), hsl(60 75% 45%), hsl(120 75% 45%)); }
-    .detail { margin-top: 12px; font-size: 0.9em; }
+    /* A fixed-height region, so selecting a device never changes the room left for the graph. */
+    .detail { margin-top: 12px; font-size: 0.9em; height: 7.5em; overflow-y: auto; }
     .detail ul { margin: 6px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 2px 28px; }
     .detail li { display: flex; justify-content: space-between; gap: 12px; }
     .detail li span:last-child { white-space: nowrap; }
@@ -62,6 +85,11 @@ export class ZhaNetworkGraphCard extends LitElement {
   @state() private scanning = false;
   /** How many screen pixels one drawing unit takes (the frame fits the drawing uniformly), so labels keep one readable size however far the graph is scaled down. */
   @state() private scale = 1;
+
+  /** The colours the theme really resolves to, read from the page, because themes do not all set the same variables. */
+  @state() private colours = { background: "#1c1c1c", foreground: "#e1e1e1" };
+  /** The tallest the graph may be, in pixels, so the whole card fits the space left on the screen. */
+  @state() private maxGraphHeight: number | undefined;
 
   private resizeObserver: ResizeObserver | undefined;
   private observed: Element | undefined;
@@ -137,14 +165,41 @@ export class ZhaNetworkGraphCard extends LitElement {
       this.resizeObserver?.disconnect();
       this.observed = graph;
       this.resizeObserver = new ResizeObserver(() => {
-        const view = this.placement?.size ?? { width: WIDTH, height: HEIGHT };
-        const box = graph.getBoundingClientRect();
-        if (box.width > 0 && box.height > 0) {
-          // The drawing is scaled uniformly to fit the frame, so the smaller of the two ratios applies.
-          this.scale = Math.min(box.width / view.width, box.height / view.height);
-        }
+        this.measure();
       });
       this.resizeObserver.observe(graph);
+      window.addEventListener("resize", this.onWindowResize);
+    }
+  }
+
+  private readonly onWindowResize = (): void => {
+    this.measure();
+  };
+
+  /** Reads the drawing scale, the theme colours and the room left on screen for the graph. */
+  private measure(): void {
+    const graph = this.renderRoot.querySelector(".graph");
+    const card = this.renderRoot.querySelector("ha-card");
+    if (graph === null || card === null) {
+      return;
+    }
+    const view = this.placement?.size ?? { width: WIDTH, height: HEIGHT };
+    const box = graph.getBoundingClientRect();
+    if (box.width > 0 && box.height > 0) {
+      // The drawing is scaled uniformly to fit the frame, so the smaller of the two ratios applies.
+      this.scale = Math.min(box.width / view.width, box.height / view.height);
+    }
+    const foreground = getComputedStyle(card).color;
+    const background = resolvedBackground(card);
+    if (foreground !== this.colours.foreground || background !== this.colours.background) {
+      this.colours = { background, foreground };
+    }
+    // Everything in the card that is not the graph (toolbar, legend, details, padding) keeps its height.
+    const chrome = card.getBoundingClientRect().height - box.height;
+    const room = Math.floor(window.innerHeight - card.getBoundingClientRect().top - chrome - BOTTOM_MARGIN);
+    const limit = Math.max(MIN_GRAPH_PX, room);
+    if (limit !== this.maxGraphHeight) {
+      this.maxGraphHeight = limit;
     }
   }
 
@@ -152,11 +207,12 @@ export class ZhaNetworkGraphCard extends LitElement {
     super.disconnectedCallback();
     this.resizeObserver?.disconnect();
     this.observed = undefined;
+    window.removeEventListener("resize", this.onWindowResize);
   }
 
   override render() {
     return html`
-      <ha-card>
+      <ha-card style=${`--zgc-bg: ${this.colours.background}; --zgc-fg: ${this.colours.foreground}`}>
         <div class="toolbar">
           <span class="title">${this.config?.title ?? "ZHA network"}</span>
           <button ?disabled=${this.scanning} @click=${() => void this.rescan()}>
@@ -185,7 +241,7 @@ export class ZhaNetworkGraphCard extends LitElement {
     }
     const named = graph.nodes.filter((node) => node.id === focus);
     return html`
-      <svg class="graph" viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
+      <svg class="graph" style=${this.maxGraphHeight === undefined ? nothing : `max-height: ${String(this.maxGraphHeight)}px`} viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
         ${graph.links.map((link) => {
           const from = positions.get(link.source);
           const to = positions.get(link.target);
@@ -210,7 +266,7 @@ export class ZhaNetworkGraphCard extends LitElement {
               @click=${(event: Event) => { event.stopPropagation(); this.select(node.id); }}
               @keydown=${(event: KeyboardEvent) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); this.select(node.id); } }}>
             <circle cx=${at.x} cy=${at.y} r=${NODE_RADIUS[node.role]}
-              fill=${this.fillFor(node)} stroke="var(--primary-text-color, currentColor)"
+              fill=${this.fillFor(node)} stroke="var(--zgc-fg)"
               stroke-width=${node.id === focus ? 4 : 2} />
             <title>${node.name}</title>
           </g>`;
@@ -243,16 +299,16 @@ export class ZhaNetworkGraphCard extends LitElement {
   /** Coordinator in the accent colour, routers solid, battery devices hollow. */
   private fillFor(node: Pick<GraphNode, "role" | "battery">): string {
     if (node.role === "coordinator") {
-      return "var(--primary-color, currentColor)";
+      return "var(--primary-color, #03a9f4)";
     }
-    return node.battery ? "var(--card-background-color, transparent)" : "var(--primary-text-color, currentColor)";
+    return node.battery ? "var(--zgc-bg)" : "var(--zgc-fg)";
   }
 
   private renderLegend() {
     const key = (role: GraphNode["role"], battery: boolean, label: string) => html`
       <span class="legend-item">
         <svg width="18" height="18" viewBox="-9 -9 18 18" aria-hidden="true">
-          <circle r=${Math.min(NODE_RADIUS[role], 7)} fill=${this.fillFor({ role, battery })} stroke="var(--primary-text-color, currentColor)" stroke-width="2" />
+          <circle r=${Math.min(NODE_RADIUS[role], 7)} fill=${this.fillFor({ role, battery })} stroke="var(--zgc-fg)" stroke-width="2" />
         </svg>${label}
       </span>`;
     return html`
