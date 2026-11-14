@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Graph, GraphNode } from "./graph";
-import { MAX_LENGTH, MIN_LENGTH, NODE_GAP, NODE_RADIUS, countCrossings, idealLength, layoutGraph } from "./layout";
+import { EDGE_CLEARANCE, MAX_LENGTH, MIN_LENGTH, NODE_GAP, NODE_RADIUS, countCrossings, countEdgeHits, idealLength, layoutGraph } from "./layout";
 import type { Placement } from "./layout";
 
 const SIZE = { width: 640, height: 480 };
@@ -205,6 +205,56 @@ describe("layoutGraph", () => {
       const second = await layoutGraph(graph, SIZE, options);
       expect(first.crossings).toBe(countCrossings(first.positions, graph.links));
       expect([...first.positions]).toEqual([...second.positions]);
+    });
+  });
+
+  describe("edges and nodes", () => {
+    const radii = new Map([["a", 5], ["b", 5], ["c", 8]]);
+    const link = [{ source: "a", target: "b" }];
+
+    it("counts a node drawn on a link that is not its own", () => {
+      const onIt = new Map([["a", at(0, 0)], ["b", at(100, 0)], ["c", at(50, 3)]]);
+      expect(countEdgeHits(onIt, link, radii)).toBe(1);
+    });
+
+    it("does not count a node that keeps its radius and clearance from the link", () => {
+      const clear = new Map([["a", at(0, 0)], ["b", at(100, 0)], ["c", at(50, 8 + EDGE_CLEARANCE)]]);
+      expect(countEdgeHits(clear, link, radii)).toBe(0);
+    });
+
+    it("never counts a link's own ends, and counts a node past the end of the segment by its distance to the end", () => {
+      const beyond = new Map([["a", at(0, 0)], ["b", at(100, 0)], ["c", at(100 + 8 + EDGE_CLEARANCE + 1, 0)]]);
+      expect(countEdgeHits(beyond, link, radii)).toBe(0);
+      expect(countEdgeHits(new Map([["a", at(0, 0)], ["b", at(100, 0)]]), link, radii)).toBe(0);
+    });
+
+    function dense(count: number, chords = 1): Graph {
+      const ids = Array.from({ length: count }, (_, index) => `n${String(index)}`);
+      const links: [string, string, number][] = [];
+      ids.forEach((id, index) => {
+        links.push([id, ids[(index + 1) % count] ?? id, 60 + ((index * 37) % 190)]);
+        links.push([id, ids[(index * 7 + 3) % count] ?? id, 30 + ((index * 53) % 220)]);
+        if (chords > 1) {
+          links.push([id, ids[(index * 5 + 2) % count] ?? id, 90 + ((index * 29) % 150)]);
+        }
+      });
+      return graphOf(ids, links.filter(([source, target]) => source !== target));
+    }
+
+    it("draws no link over a node that is not its end on a network the size of a house, and reports it", { timeout: 60000 }, async () => {
+      const graph = dense(30);
+      const placement = await layoutGraph(graph, SIZE);
+      const radius = new Map(graph.nodes.map((node) => [node.id, NODE_RADIUS[node.role]]));
+      expect(countEdgeHits(placement.positions, graph.links, radius)).toBe(placement.edgeHits);
+      expect(placement.edgeHits).toBe(0);
+    });
+
+    it("draws fewer links over nodes than the force layout alone", { timeout: 60000 }, async () => {
+      const graph = dense(30, 2);
+      const forceOnly = await layoutGraph(graph, SIZE, { restarts: 6, refineSteps: 0 });
+      const annealed = await layoutGraph(graph, SIZE, { restarts: 6, refineSteps: 20000 });
+      expect(forceOnly.edgeHits).toBeGreaterThan(0);
+      expect(annealed.edgeHits).toBeLessThan(forceOnly.edgeHits);
     });
   });
 });
