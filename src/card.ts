@@ -20,6 +20,8 @@ interface Hass {
 const WIDTH = 640;
 const HEIGHT = 480;
 /** Links get thicker as the signal improves, so quality reads from width as well as colour. */
+/** Label text height in screen pixels. */
+const LABEL_PX = 13;
 const MIN_STROKE = 1;
 const MAX_STROKE = 3.5;
 /** What an unselected part of the drawing fades to while a device is selected. */
@@ -38,15 +40,13 @@ export class ZhaNetworkGraphCard extends LitElement {
     .node:focus-visible { outline: none; }
     .node:focus-visible circle { stroke-width: 4; }
     .link { transition: opacity 0.15s; }
-    .label {
-      font-size: 13px; fill: var(--primary-text-color, currentColor); pointer-events: none;
-      paint-order: stroke; stroke: var(--card-background-color, #fff); stroke-width: 4px; stroke-linejoin: round;
-    }
+    .label-box { fill: var(--card-background-color, #fff); stroke: var(--divider-color, currentColor); opacity: 0.96; pointer-events: none; }
+    .label { fill: var(--primary-text-color, currentColor); pointer-events: none; }
     .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; margin-top: 8px; font-size: 0.85em; color: var(--secondary-text-color, inherit); }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; }
     .scale { width: 90px; height: 8px; border-radius: 4px; background: linear-gradient(to right, hsl(0 75% 45%), hsl(60 75% 45%), hsl(120 75% 45%)); }
     .detail { margin-top: 12px; font-size: 0.9em; }
-    .detail ul { margin: 6px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; }
+    .detail ul { margin: 6px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 2px 28px; }
     .detail li { display: flex; justify-content: space-between; gap: 12px; }
     .error { color: var(--error-color, #db4437); margin-bottom: 8px; }
     button { cursor: pointer; }
@@ -59,6 +59,11 @@ export class ZhaNetworkGraphCard extends LitElement {
   @state() private selected: string | undefined;
   @state() private error: string | undefined;
   @state() private scanning = false;
+  /** How many screen pixels one drawing unit takes (the frame fits the drawing uniformly), so labels keep one readable size however far the graph is scaled down. */
+  @state() private scale = 1;
+
+  private resizeObserver: ResizeObserver | undefined;
+  private observed: Element | undefined;
 
   private hassObject: Hass | undefined;
   /** Incremented per load so a slow layout from an earlier load cannot overwrite a newer one. */
@@ -125,6 +130,29 @@ export class ZhaNetworkGraphCard extends LitElement {
     this.selected = this.selected === id ? undefined : id;
   }
 
+  override updated(): void {
+    const graph = this.renderRoot.querySelector(".graph");
+    if (graph !== null && graph !== this.observed) {
+      this.resizeObserver?.disconnect();
+      this.observed = graph;
+      this.resizeObserver = new ResizeObserver(() => {
+        const view = this.placement?.size ?? { width: WIDTH, height: HEIGHT };
+        const box = graph.getBoundingClientRect();
+        if (box.width > 0 && box.height > 0) {
+          // The drawing is scaled uniformly to fit the frame, so the smaller of the two ratios applies.
+          this.scale = Math.min(box.width / view.width, box.height / view.height);
+        }
+      });
+      this.resizeObserver.observe(graph);
+    }
+  }
+
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.resizeObserver?.disconnect();
+    this.observed = undefined;
+  }
+
   override render() {
     return html`
       <ha-card>
@@ -188,9 +216,26 @@ export class ZhaNetworkGraphCard extends LitElement {
         })}
         ${named.map((node) => {
           const at = positions.get(node.id);
-          return at === undefined ? nothing : svg`<text class="label" x=${at.x} y=${at.y - NODE_RADIUS[node.role] - 6} text-anchor="middle">${node.name}</text>`;
+          return at === undefined ? nothing : this.renderLabel(node, at, size.width);
         })}
       </svg>
+    `;
+  }
+
+  /** A name tag with a solid background above the node, kept at LABEL_PX on screen and inside the drawing's edges. */
+  private renderLabel(node: GraphNode, at: { x: number; y: number }, viewWidth: number) {
+    const unit = 1 / this.scale;
+    const fontSize = LABEL_PX * unit;
+    const padX = 6 * unit;
+    const padY = 3 * unit;
+    const width = node.name.length * 0.6 * fontSize + 2 * padX;
+    const height = fontSize + 2 * padY;
+    const x = Math.min(Math.max(at.x, width / 2 + unit), viewWidth - width / 2 - unit);
+    const bottom = at.y - NODE_RADIUS[node.role] - 4 * unit;
+    const top = Math.max(bottom - height, unit);
+    return svg`
+      <rect class="label-box" x=${x - width / 2} y=${top} width=${width} height=${height} rx=${4 * unit} stroke-width=${unit} />
+      <text class="label" x=${x} y=${top + height / 2} font-size=${fontSize} text-anchor="middle" dominant-baseline="central">${node.name}</text>
     `;
   }
 
