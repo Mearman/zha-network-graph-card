@@ -73,7 +73,7 @@ describe("layoutGraph", () => {
         ([s, t]): [string, string, number] => [s ?? "", t ?? "", 120],
       ),
     );
-    expect((await layoutGraph(dense, SIZE, 40)).crossings).toBeLessThanOrEqual((await layoutGraph(dense, SIZE, 1)).crossings);
+    expect((await layoutGraph(dense, SIZE, { restarts: 40, refineSteps: 0 })).crossings).toBeLessThanOrEqual((await layoutGraph(dense, SIZE, { restarts: 1, refineSteps: 0 })).crossings);
   });
 
   it("draws a strong link shorter than a weak one from the same node", async () => {
@@ -159,7 +159,7 @@ describe("layoutGraph", () => {
 
     it("keeps every pair clear in a dense mixed network", async () => {
       const graph = dense(38, ["coordinator", "router", "end-device", "end-device"]);
-      const placement = await layoutGraph(graph, { width: 300, height: 220 }, 4);
+      const placement = await layoutGraph(graph, { width: 300, height: 220 }, { restarts: 4, refineSteps: 500 });
       expect(worstOverlap(placement, graph)).toBeLessThanOrEqual(1e-6);
     });
 
@@ -167,15 +167,44 @@ describe("layoutGraph", () => {
       const graph = dense(10, ["router"]);
       const lone = Array.from({ length: 40 }, (_, index) => ({ ...node(`lone${String(index)}`), role: index % 5 === 0 ? ("coordinator" as const) : ("end-device" as const) }));
       const mixed = { nodes: [...graph.nodes, ...lone], links: graph.links };
-      expect(worstOverlap(await layoutGraph(mixed, { width: 300, height: 220 }, 4), mixed)).toBeLessThanOrEqual(1e-6);
+      expect(worstOverlap(await layoutGraph(mixed, { width: 300, height: 220 }, { restarts: 4, refineSteps: 500 }), mixed)).toBeLessThanOrEqual(1e-6);
     });
 
     it("grows the area instead of letting nodes overlap when the requested size is too small", async () => {
       const graph = dense(38, ["router"]);
       const tiny = { width: 120, height: 90 };
-      const placement = await layoutGraph(graph, tiny, 4);
+      const placement = await layoutGraph(graph, tiny, { restarts: 4, refineSteps: 500 });
       expect(worstOverlap(placement, graph)).toBeLessThanOrEqual(1e-6);
       expect(placement.size.width).toBeGreaterThan(tiny.width);
+    });
+  });
+
+  describe("annealing", () => {
+    function dense(count: number): Graph {
+      const ids = Array.from({ length: count }, (_, index) => `n${String(index)}`);
+      const links: [string, string, number][] = [];
+      ids.forEach((id, index) => {
+        links.push([id, ids[(index + 1) % count] ?? id, 60 + ((index * 37) % 190)]);
+        links.push([id, ids[(index * 7 + 3) % count] ?? id, 30 + ((index * 53) % 220)]);
+      });
+      return graphOf(ids, links.filter(([source, target]) => source !== target));
+    }
+
+    it("leaves fewer crossings than the force layout alone on a dense network", async () => {
+      const graph = dense(24);
+      const forceOnly = await layoutGraph(graph, SIZE, { restarts: 6, refineSteps: 0 });
+      const annealed = await layoutGraph(graph, SIZE, { restarts: 6, refineSteps: 8000 });
+      expect(forceOnly.crossings).toBeGreaterThan(0);
+      expect(annealed.crossings).toBeLessThan(forceOnly.crossings);
+    });
+
+    it("reports the crossings of the drawing it returns, and draws the same picture for the same data", async () => {
+      const graph = dense(16);
+      const options = { restarts: 4, refineSteps: 2000 };
+      const first = await layoutGraph(graph, SIZE, options);
+      const second = await layoutGraph(graph, SIZE, options);
+      expect(first.crossings).toBe(countCrossings(first.positions, graph.links));
+      expect([...first.positions]).toEqual([...second.positions]);
     });
   });
 });

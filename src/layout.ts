@@ -32,8 +32,16 @@ export const MIN_LENGTH = 30;
 export const MAX_LENGTH = 220;
 
 /** Independent starts tried per layout; each is a separate force simulation from a seeded random start. */
-export const DEFAULT_RESTARTS = 40;
+export const DEFAULT_RESTARTS = 12;
 const TICKS = 400;
+/** Candidate layouts, best first by crossings, that go on to the annealing pass. */
+export const REFINED_CANDIDATES = 3;
+/** Moves tried per annealed candidate. */
+export const DEFAULT_REFINE_STEPS = 60000;
+/** What one crossing costs the annealer, in the squared length error of links: about a 45 unit error. */
+const CROSSING_COST = 2000;
+/** A moved node may not come closer than this to another node, so annealing cannot pile nodes together. */
+const MIN_SEPARATION = MIN_LENGTH * 0.7;
 const PADDING = 24;
 /** Spacing of the row of devices that have no known link, in the same units as the size. */
 const ROW_SPACING = 2 * NODE_RADIUS.coordinator + NODE_GAP;
@@ -220,6 +228,92 @@ function fit(positions: Map<string, Point>, size: Size, radii: ReadonlyMap<strin
   };
 }
 
+
+/**
+ * Simulated annealing on the finished force layout. Each step moves one node by a random offset and keeps the
+ * move when it lowers a cost of crossings plus squared link-length error, or, early on while the temperature is
+ * high, sometimes when it does not, so the search can leave a poor arrangement. Only links at the moved node are
+ * re-examined, so a step costs a small multiple of the link count. Seeded, so the result is reproducible.
+ */
+function anneal(start: ReadonlyMap<string, Point>, graph: Graph, seed: number, steps: number): Map<string, Point> {
+  const ids = [...start.keys()];
+  const slot = new Map(ids.map((id, index) => [id, index]));
+  const xs = Float64Array.from(ids, (id) => start.get(id)?.x ?? 0);
+  const ys = Float64Array.from(ids, (id) => start.get(id)?.y ?? 0);
+  const ends: [number, number][] = [];
+  const ideal: number[] = [];
+  const incident: number[][] = ids.map(() => []);
+  for (const link of graph.links) {
+    const a = slot.get(link.source);
+    const b = slot.get(link.target);
+    if (a !== undefined && b !== undefined) {
+      incident[a]?.push(ends.length);
+      incident[b]?.push(ends.length);
+      ends.push([a, b]);
+      ideal.push(idealLength(link.lqi));
+    }
+  }
+  const x = (index: number): number => xs[index] ?? 0;
+  const y = (index: number): number => ys[index] ?? 0;
+  const side = (a: number, b: number, c: number): number => Math.sign((x(b) - x(a)) * (y(c) - y(a)) - (y(b) - y(a)) * (x(c) - x(a)));
+  const crosses = (l: number, m: number): boolean => {
+    const [a, b] = ends[l] ?? [0, 0];
+    const [c, d] = ends[m] ?? [0, 0];
+    if (a === c || a === d || b === c || b === d) {
+      return false;
+    }
+    return side(a, b, c) !== side(a, b, d) && side(c, d, a) !== side(c, d, b);
+  };
+  /** Crossings of the links at `node` with every other link. */
+  const crossingsAt = (node: number): number => {
+    let count = 0;
+    for (const l of incident[node] ?? []) {
+      for (let m = 0; m < ends.length; m += 1) {
+        if (m !== l && crosses(l, m)) {
+          count += 1;
+        }
+      }
+    }
+    return count;
+  };
+  const lengthError = (node: number): number => {
+    let total = 0;
+    for (const l of incident[node] ?? []) {
+      const [a, b] = ends[l] ?? [0, 0];
+      total += (Math.hypot(x(a) - x(b), y(a) - y(b)) - (ideal[l] ?? 0)) ** 2;
+    }
+    return total;
+  };
+  const crowded = (node: number): boolean => {
+    for (let other = 0; other < ids.length; other += 1) {
+      if (other !== node && Math.hypot(x(node) - x(other), y(node) - y(other)) < MIN_SEPARATION) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const random = seededRandom(seed);
+  const hot = CROSSING_COST;
+  const cold = 2;
+  for (let step = 0; step < steps; step += 1) {
+    const progress = step / steps;
+    const temperature = hot * (cold / hot) ** progress;
+    const reach = MIN_LENGTH + MAX_LENGTH * 0.5 * (1 - progress);
+    const node = Math.floor(random() * ids.length);
+    const [oldX, oldY] = [x(node), y(node)];
+    const before = CROSSING_COST * crossingsAt(node) + lengthError(node);
+    xs[node] = oldX + (random() * 2 - 1) * reach;
+    ys[node] = oldY + (random() * 2 - 1) * reach;
+    const delta = CROSSING_COST * crossingsAt(node) + lengthError(node) - before;
+    if (crowded(node) || (delta > 0 && random() >= Math.exp(-delta / temperature))) {
+      xs[node] = oldX;
+      ys[node] = oldY;
+    }
+  }
+  return new Map(ids.map((id, index) => [id, { x: x(index), y: y(index) }]));
+}
+
 /**
  * Devices that appear in no link are not part of the mesh as far as ZHA's neighbour tables say, so they are
  * kept out of the force simulation (nothing would hold them near the rest) and drawn as a tidy row below it.
@@ -248,7 +342,15 @@ function placeUnlinked(ids: readonly string[], size: Size, top: number): Map<str
  * It yields to the event loop between starts so a large network does not freeze the page while it searches.
  * Devices with no link are placed in a row below the mesh.
  */
-export async function layoutGraph(graph: Graph, size: Size, restarts: number = DEFAULT_RESTARTS): Promise<Placement> {
+export interface LayoutOptions {
+  /** Independent force-simulation starts to try. */
+  restarts?: number;
+  /** Annealing moves for each of the best starts; 0 turns the annealing pass off. */
+  refineSteps?: number;
+}
+
+export async function layoutGraph(graph: Graph, size: Size, options: LayoutOptions = {}): Promise<Placement> {
+  const { restarts = DEFAULT_RESTARTS, refineSteps = DEFAULT_REFINE_STEPS } = options;
   const radii = new Map(graph.nodes.map((node) => [node.id, NODE_RADIUS[node.role]]));
   const linked = new Set(graph.links.flatMap((link) => [link.source, link.target]));
   const unlinked = graph.nodes.filter((node) => !linked.has(node.id)).map((node) => node.id);
@@ -258,15 +360,22 @@ export async function layoutGraph(graph: Graph, size: Size, restarts: number = D
   let crossings = 0;
   if (meshNodes.length > 0) {
     const meshGraph: Graph = { nodes: meshNodes, links: graph.links };
-    let best: { positions: Map<string, Point>; crossings: number; stress: number } | undefined;
+    const candidates: { positions: Map<string, Point>; crossings: number; stress: number }[] = [];
     for (let seed = 1; seed <= restarts; seed += 1) {
       await yieldToEventLoop();
       const positions = simulate(meshGraph, seed);
-      const candidate = { positions, crossings: countCrossings(positions, graph.links), stress: stress(positions, graph.links) };
-      if (best === undefined || candidate.crossings < best.crossings || (candidate.crossings === best.crossings && candidate.stress < best.stress)) {
-        best = candidate;
-      }
+      candidates.push({ positions, crossings: countCrossings(positions, graph.links), stress: stress(positions, graph.links) });
     }
+    const byQuality = (a: { crossings: number; stress: number }, b: { crossings: number; stress: number }): number =>
+      a.crossings - b.crossings || a.stress - b.stress;
+    candidates.sort(byQuality);
+    for (const [rank, candidate] of candidates.slice(0, REFINED_CANDIDATES).entries()) {
+      await yieldToEventLoop();
+      const positions = anneal(candidate.positions, meshGraph, 1000 + rank, refineSteps);
+      candidates.push({ positions, crossings: countCrossings(positions, graph.links), stress: stress(positions, graph.links) });
+    }
+    candidates.sort(byQuality);
+    const best = candidates[0];
     if (best === undefined) {
       throw new Error("layoutGraph needs at least one restart");
     }
