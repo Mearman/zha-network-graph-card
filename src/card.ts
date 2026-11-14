@@ -32,7 +32,8 @@ export class ZhaNetworkGraphCard extends LitElement {
     ha-card { padding: 16px; display: block; }
     .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .title { font-size: 1.2em; font-weight: 500; }
-    .graph { width: 100%; height: auto; display: block; }
+    /* The graph shrinks to fit the screen, keeping its proportions, so the legend and details stay in view. */
+    .graph { width: 100%; height: auto; max-height: calc(100vh - 230px); min-height: 240px; display: block; }
     .node { cursor: pointer; transition: opacity 0.15s; }
     .node:focus-visible { outline: none; }
     .node:focus-visible circle { stroke-width: 4; }
