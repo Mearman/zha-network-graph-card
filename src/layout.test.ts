@@ -259,4 +259,53 @@ describe("layoutGraph", () => {
       expect(annealed.edgeHits).toBeLessThan(forceOnly.edgeHits);
     });
   });
+
+  describe("devices with a single link", () => {
+    /** A ring of routers, each with two single-link devices; every leaf has a free spot outside the ring. */
+    function ringWithLeaves(): Graph {
+      const ring = Array.from({ length: 6 }, (_, index) => `r${String(index)}`);
+      const nodes = ring.map(node);
+      const links: Graph["links"] = ring.map((id, index) => ({ source: id, target: ring[(index + 1) % ring.length] ?? id, lqi: 150 }));
+      ring.forEach((id) => {
+        for (const suffix of ["a", "b"]) {
+          nodes.push(node(`${id}${suffix}`));
+          links.push({ source: id, target: `${id}${suffix}`, lqi: 120 });
+        }
+      });
+      return { nodes, links };
+    }
+
+    it("leaves no crossing and no link over a node when every leaf has room outside the core", async () => {
+      const graph = ringWithLeaves();
+      const placement = await layoutGraph(graph, { width: 960, height: 720 }, { restarts: 4, refineSteps: 4000 });
+      expect(placement.crossings).toBe(0);
+      expect(placement.edgeHits).toBe(0);
+    });
+
+    it("adds no crossing of its own for any single-link device in a dense core", async () => {
+      const coreIds = Array.from({ length: 9 }, (_, index) => `c${String(index)}`);
+      const nodes = coreIds.map(node);
+      const links: Graph["links"] = [];
+      coreIds.forEach((id, index) => {
+        links.push({ source: id, target: coreIds[(index + 1) % coreIds.length] ?? id, lqi: 160 });
+        links.push({ source: id, target: coreIds[(index * 4 + 2) % coreIds.length] ?? id, lqi: 90 });
+      });
+      const coreLinks = links.filter((link) => link.source !== link.target);
+      coreIds.forEach((id, index) => {
+        for (let leaf = 0; leaf < 2 + (index % 2); leaf += 1) {
+          nodes.push(node(`${id}-l${String(leaf)}`));
+          links.push({ source: id, target: `${id}-l${String(leaf)}`, lqi: 100 + leaf * 40 });
+        }
+      });
+      const placement = await layoutGraph({ nodes, links: links.filter((link) => link.source !== link.target) }, { width: 960, height: 720 }, { restarts: 4, refineSteps: 6000 });
+      expect(placement.crossings).toBe(countCrossings(placement.positions, coreLinks));
+    });
+
+    it("draws links clear of other nodes by at least the edge clearance", async () => {
+      const graph = ringWithLeaves();
+      const placement = await layoutGraph(graph, { width: 960, height: 720 }, { restarts: 4, refineSteps: 4000 });
+      const radius = new Map(graph.nodes.map((n) => [n.id, NODE_RADIUS[n.role]]));
+      expect(countEdgeHits(placement.positions, graph.links, radius)).toBe(0);
+    });
+  });
 });
