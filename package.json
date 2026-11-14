@@ -1,0 +1,31 @@
+{
+  "name": "zha-network-graph-card",
+  "version": "0.0.0",
+  "description": "Lovelace card that draws a ZHA Zigbee network as a graph, coloured by link quality",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mearman/zha-network-graph-card.git"
+  },
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "d3-force": "3.0.1",
+    "lit": "3.3.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/d3-force": "3.0.10",
+    "eslint": "10.14.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "8.72.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  },
+  "packageManager": "pnpm@12.16.1"
+}
