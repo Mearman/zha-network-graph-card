@@ -24,30 +24,12 @@ const HEIGHT = 480;
 const BOTTOM_MARGIN = 12;
 /** The graph never shrinks below this height, even on a very short screen. */
 const MIN_GRAPH_PX = 200;
-/** Label text height in screen pixels. */
-const LABEL_PX = 13;
+/** Average width of one label character in screen pixels at the label's font size. */
+const LABEL_CHAR_PX = 7.2;
 const MIN_STROKE = 1;
 const MAX_STROKE = 3.5;
 /** What an unselected part of the drawing fades to while a device is selected. */
 const FADED = 0.18;
-
-/**
- * The first opaque background colour at or above `start`, walking out through shadow roots, or a dark
- * default. A card in a themed dashboard is often transparent and the colour comes from a parent.
- */
-function resolvedBackground(start: Element): string {
-  let node: Element | null = start;
-  while (node !== null) {
-    const colour = getComputedStyle(node).backgroundColor;
-    const alpha = /^rgba\(.*,\s*([\d.]+)\)$/.exec(colour)?.[1];
-    if (colour !== "transparent" && (alpha === undefined ? colour.startsWith("rgb") : Number(alpha) > 0.9)) {
-      return colour;
-    }
-    const root: Node = node.getRootNode();
-    node = node.parentElement ?? (root instanceof ShadowRoot ? root.host : null);
-  }
-  return "#1c1c1c";
-}
 
 const strokeFor = (lqi: number): number => MIN_STROKE + ((MAX_STROKE - MIN_STROKE) * Math.min(Math.max(lqi, 0), MAX_LQI)) / MAX_LQI;
 
@@ -62,8 +44,20 @@ export class ZhaNetworkGraphCard extends LitElement {
     .node:focus-visible { outline: none; }
     .node:focus-visible circle { stroke-width: 4; }
     .link { transition: opacity 0.15s; }
-    .label-box { fill: var(--zgc-bg); stroke: var(--zgc-fg); stroke-opacity: 0.5; pointer-events: none; }
-    .label { fill: var(--zgc-fg); pointer-events: none; }
+    .graph-wrap { position: relative; }
+    /* Colours come from the theme's own variables in ordinary CSS, because that is what a colour-adjusting
+       extension such as Dark Reader rewrites consistently; colours copied into attributes are missed. */
+    .node-shape { stroke: var(--primary-text-color, CanvasText); }
+    .node-shape.mains { fill: var(--primary-text-color, CanvasText); }
+    .node-shape.battery { fill: var(--ha-card-background, var(--card-background-color, Canvas)); }
+    .node-shape.coordinator { fill: var(--primary-color, #03a9f4); }
+    .label {
+      position: absolute; transform: translate(-50%, -100%); white-space: nowrap; pointer-events: none;
+      font-size: 13px; line-height: 1.2; padding: 2px 6px; border-radius: 4px;
+      background: var(--ha-card-background, var(--card-background-color, Canvas));
+      color: var(--primary-text-color, CanvasText);
+      border: 1px solid var(--divider-color, GrayText);
+    }
     .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; margin-top: 8px; font-size: 0.85em; color: var(--secondary-text-color, inherit); }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; }
     .scale { width: 90px; height: 8px; border-radius: 4px; background: linear-gradient(to right, hsl(0 75% 45%), hsl(60 75% 45%), hsl(120 75% 45%)); }
@@ -83,11 +77,9 @@ export class ZhaNetworkGraphCard extends LitElement {
   @state() private selected: string | undefined;
   @state() private error: string | undefined;
   @state() private scanning = false;
-  /** How many screen pixels one drawing unit takes (the frame fits the drawing uniformly), so labels keep one readable size however far the graph is scaled down. */
-  @state() private scale = 1;
+  /** Where the drawing sits inside its frame on screen: pixels per drawing unit and the margins left by fitting it uniformly. */
+  @state() private frame = { scale: 1, offsetX: 0, offsetY: 0, width: WIDTH };
 
-  /** The colours the theme really resolves to, read from the page, because themes do not all set the same variables. */
-  @state() private colours = { background: "#1c1c1c", foreground: "#e1e1e1" };
   /** The tallest the graph may be, in pixels, so the whole card fits the space left on the screen. */
   @state() private maxGraphHeight: number | undefined;
 
@@ -176,7 +168,7 @@ export class ZhaNetworkGraphCard extends LitElement {
     this.measure();
   };
 
-  /** Reads the drawing scale, the theme colours and the room left on screen for the graph. */
+  /** Reads where the drawing sits on screen and the room left for it. */
   private measure(): void {
     const graph = this.renderRoot.querySelector(".graph");
     const card = this.renderRoot.querySelector("ha-card");
@@ -186,13 +178,18 @@ export class ZhaNetworkGraphCard extends LitElement {
     const view = this.placement?.size ?? { width: WIDTH, height: HEIGHT };
     const box = graph.getBoundingClientRect();
     if (box.width > 0 && box.height > 0) {
-      // The drawing is scaled uniformly to fit the frame, so the smaller of the two ratios applies.
-      this.scale = Math.min(box.width / view.width, box.height / view.height);
-    }
-    const foreground = getComputedStyle(card).color;
-    const background = resolvedBackground(card);
-    if (foreground !== this.colours.foreground || background !== this.colours.background) {
-      this.colours = { background, foreground };
+      // The drawing is scaled uniformly to fit the frame and centred, so the smaller ratio applies.
+      const scale = Math.min(box.width / view.width, box.height / view.height);
+      const next = {
+        scale,
+        offsetX: (box.width - view.width * scale) / 2,
+        offsetY: (box.height - view.height * scale) / 2,
+        width: box.width,
+      };
+      const now = this.frame;
+      if (Math.abs(next.scale - now.scale) > 1e-3 || Math.abs(next.offsetX - now.offsetX) > 0.5 || Math.abs(next.offsetY - now.offsetY) > 0.5 || next.width !== now.width) {
+        this.frame = next;
+      }
     }
     // Everything in the card that is not the graph (toolbar, legend, details, padding) keeps its height.
     const chrome = card.getBoundingClientRect().height - box.height;
@@ -212,7 +209,7 @@ export class ZhaNetworkGraphCard extends LitElement {
 
   override render() {
     return html`
-      <ha-card style=${`--zgc-bg: ${this.colours.background}; --zgc-fg: ${this.colours.foreground}`}>
+      <ha-card>
         <div class="toolbar">
           <span class="title">${this.config?.title ?? "ZHA network"}</span>
           <button ?disabled=${this.scanning} @click=${() => void this.rescan()}>
@@ -241,6 +238,7 @@ export class ZhaNetworkGraphCard extends LitElement {
     }
     const named = graph.nodes.filter((node) => node.id === focus);
     return html`
+      <div class="graph-wrap">
       <svg class="graph" style=${this.maxGraphHeight === undefined ? nothing : `max-height: ${String(this.maxGraphHeight)}px`} viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
         ${graph.links.map((link) => {
           const from = positions.get(link.source);
@@ -265,50 +263,36 @@ export class ZhaNetworkGraphCard extends LitElement {
               opacity=${faded ? FADED : node.available ? 1 : 0.4}
               @click=${(event: Event) => { event.stopPropagation(); this.select(node.id); }}
               @keydown=${(event: KeyboardEvent) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); this.select(node.id); } }}>
-            <circle cx=${at.x} cy=${at.y} r=${NODE_RADIUS[node.role]}
-              fill=${this.fillFor(node)} stroke="var(--zgc-fg)"
+            <circle class=${`node-shape ${node.role === "coordinator" ? "coordinator" : node.battery ? "battery" : "mains"}`}
+              cx=${at.x} cy=${at.y} r=${NODE_RADIUS[node.role]}
               stroke-width=${node.id === focus ? 4 : 2} />
             <title>${node.name}</title>
           </g>`;
         })}
-        ${named.map((node) => {
-          const at = positions.get(node.id);
-          return at === undefined ? nothing : this.renderLabel(node, at, size.width);
-        })}
       </svg>
+      ${named.map((node) => {
+        const at = positions.get(node.id);
+        return at === undefined ? nothing : this.renderLabel(node, at);
+      })}
+      </div>
     `;
   }
 
-  /** A name tag with a solid background above the node, kept at LABEL_PX on screen and inside the drawing's edges. */
-  private renderLabel(node: GraphNode, at: { x: number; y: number }, viewWidth: number) {
-    const unit = 1 / this.scale;
-    const fontSize = LABEL_PX * unit;
-    const padX = 6 * unit;
-    const padY = 3 * unit;
-    const width = node.name.length * 0.6 * fontSize + 2 * padX;
-    const height = fontSize + 2 * padY;
-    const x = Math.min(Math.max(at.x, width / 2 + unit), viewWidth - width / 2 - unit);
-    const bottom = at.y - NODE_RADIUS[node.role] - 4 * unit;
-    const top = Math.max(bottom - height, unit);
-    return svg`
-      <rect class="label-box" x=${x - width / 2} y=${top} width=${width} height=${height} rx=${4 * unit} stroke-width=${unit} />
-      <text class="label" x=${x} y=${top + height / 2} font-size=${fontSize} text-anchor="middle" dominant-baseline="central">${node.name}</text>
-    `;
-  }
-
-  /** Coordinator in the accent colour, routers solid, battery devices hollow. */
-  private fillFor(node: Pick<GraphNode, "role" | "battery">): string {
-    if (node.role === "coordinator") {
-      return "var(--primary-color, #03a9f4)";
-    }
-    return node.battery ? "var(--zgc-bg)" : "var(--zgc-fg)";
+  /** A name tag above the node, an HTML element so it is themed like the rest of the card, kept inside the frame. */
+  private renderLabel(node: GraphNode, at: { x: number; y: number }) {
+    const { scale, offsetX, offsetY, width } = this.frame;
+    // Half the tag's width, estimated from the name, so the tag can be kept inside the frame before it is measured.
+    const half = (node.name.length * LABEL_CHAR_PX + 14) / 2;
+    const left = Math.min(Math.max(offsetX + at.x * scale, half), Math.max(width - half, half));
+    const top = Math.max(offsetY + (at.y - NODE_RADIUS[node.role]) * scale - 4, 20);
+    return html`<div class="label" style=${`left: ${String(left)}px; top: ${String(top)}px`}>${node.name}</div>`;
   }
 
   private renderLegend() {
     const key = (role: GraphNode["role"], battery: boolean, label: string) => html`
       <span class="legend-item">
         <svg width="18" height="18" viewBox="-9 -9 18 18" aria-hidden="true">
-          <circle r=${Math.min(NODE_RADIUS[role], 7)} fill=${this.fillFor({ role, battery })} stroke="var(--zgc-fg)" stroke-width="2" />
+          <circle class=${`node-shape ${role === "coordinator" ? "coordinator" : battery ? "battery" : "mains"}`} r=${Math.min(NODE_RADIUS[role], 7)} stroke-width="2" />
         </svg>${label}
       </span>`;
     return html`
