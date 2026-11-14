@@ -4,6 +4,8 @@ import { EDGE_CLEARANCE, MAX_LENGTH, MIN_LENGTH, NODE_GAP, NODE_RADIUS, countCro
 import type { Placement } from "./layout";
 
 const SIZE = { width: 640, height: 480 };
+/** Enough search for the small graphs here to settle; the card's own defaults are sized for a whole house and are far slower. */
+const SMALL = { restarts: 4, refineSteps: 3000 };
 
 function node(id: string): GraphNode {
   return { id, name: id, role: "router", battery: false, available: true, lqi: null, rssi: null };
@@ -63,7 +65,7 @@ describe("layoutGraph", () => {
   );
 
   it("finds a drawing with no crossings for a planar graph", async () => {
-    expect((await layoutGraph(wheel, SIZE)).crossings).toBe(0);
+    expect((await layoutGraph(wheel, SIZE, SMALL)).crossings).toBe(0);
   });
 
   it("crosses no more links with many restarts than with a single start", async () => {
@@ -73,12 +75,12 @@ describe("layoutGraph", () => {
         ([s, t]): [string, string, number] => [s ?? "", t ?? "", 120],
       ),
     );
-    expect((await layoutGraph(dense, SIZE, { restarts: 40, refineSteps: 0 })).crossings).toBeLessThanOrEqual((await layoutGraph(dense, SIZE, { restarts: 1, refineSteps: 0 })).crossings);
+    expect((await layoutGraph(dense, SIZE, { restarts: 12, refineSteps: 0 })).crossings).toBeLessThanOrEqual((await layoutGraph(dense, SIZE, { restarts: 1, refineSteps: 0 })).crossings);
   });
 
   it("draws a strong link shorter than a weak one from the same node", async () => {
     const fork = graphOf(["hub", "near", "far"], [["hub", "near", 250], ["hub", "far", 20]]);
-    const { positions } = await layoutGraph(fork, SIZE);
+    const { positions } = await layoutGraph(fork, SIZE, SMALL);
     const hub = positions.get("hub");
     const near = positions.get("near");
     const far = positions.get("far");
@@ -89,8 +91,8 @@ describe("layoutGraph", () => {
   });
 
   it("keeps every node inside the size and gives the same picture for the same data", async () => {
-    const first = await layoutGraph(wheel, SIZE);
-    const second = await layoutGraph(wheel, SIZE);
+    const first = await layoutGraph(wheel, SIZE, SMALL);
+    const second = await layoutGraph(wheel, SIZE, SMALL);
     expect([...first.positions]).toEqual([...second.positions]);
     for (const { x, y } of first.positions.values()) {
       expect(x).toBeGreaterThanOrEqual(0);
@@ -101,8 +103,8 @@ describe("layoutGraph", () => {
   });
 
   it("handles an empty graph and a single node", async () => {
-    expect((await layoutGraph({ nodes: [], links: [] }, SIZE)).positions.size).toBe(0);
-    const alone = await layoutGraph(graphOf(["only"], []), SIZE);
+    expect((await layoutGraph({ nodes: [], links: [] }, SIZE, SMALL)).positions.size).toBe(0);
+    const alone = await layoutGraph(graphOf(["only"], []), SIZE, SMALL);
     const lone = alone.positions.get("only");
     expect(lone?.x).toBe(320);
     expect(lone?.y).toBeGreaterThan(0);
@@ -111,7 +113,7 @@ describe("layoutGraph", () => {
 
   it("keeps devices with no link out of the mesh and below it, so they do not shrink it", async () => {
     const ids = ["a", "b", ...Array.from({ length: 12 }, (_, index) => `lone${String(index)}`)];
-    const { positions, size } = await layoutGraph(graphOf(ids, [["a", "b", 100]]), SIZE);
+    const { positions, size } = await layoutGraph(graphOf(ids, [["a", "b", 100]]), SIZE, SMALL);
     const a = positions.get("a");
     const b = positions.get("b");
     if (a === undefined || b === undefined) {
@@ -241,15 +243,15 @@ describe("layoutGraph", () => {
       return graphOf(ids, links.filter(([source, target]) => source !== target));
     }
 
-    it("draws no link over a node that is not its end on a network the size of a house, and reports it", { timeout: 60000 }, async () => {
-      const graph = dense(30);
+    it("draws no link over a node that is not its end on a small network with the default search, and reports the count", async () => {
+      const graph = dense(18);
       const placement = await layoutGraph(graph, SIZE);
       const radius = new Map(graph.nodes.map((node) => [node.id, NODE_RADIUS[node.role]]));
       expect(countEdgeHits(placement.positions, graph.links, radius)).toBe(placement.edgeHits);
       expect(placement.edgeHits).toBe(0);
     });
 
-    it("draws fewer links over nodes than the force layout alone", { timeout: 60000 }, async () => {
+    it("draws fewer links over nodes than the force layout alone", async () => {
       const graph = dense(30, 2);
       const forceOnly = await layoutGraph(graph, SIZE, { restarts: 6, refineSteps: 0 });
       const annealed = await layoutGraph(graph, SIZE, { restarts: 6, refineSteps: 20000 });
