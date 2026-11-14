@@ -26,8 +26,8 @@ interface Hass {
   callWS(message: { type: string }): Promise<unknown>;
 }
 
-const WIDTH = 640;
-const HEIGHT = 480;
+const WIDTH = 960;
+const HEIGHT = 720;
 /** Radius, in drawing units, of a node that holds its own name. */
 const NODE_UNITS = NODE_RADIUS.coordinator;
 /** A node's on-screen radius is this fraction of the room each device has on average, within the bounds below. */
@@ -82,6 +82,9 @@ export class ZhaNetworkGraphCard extends LitElement {
     .node-shape { fill: transparent; pointer-events: all; stroke: var(--primary-text-color, CanvasText); stroke-width: calc(var(--u) * 2px); }
     .node-shape.coordinator { stroke: var(--primary-color, #03a9f4); stroke-width: calc(var(--u) * 3px); }
     .node-shape.battery { stroke-dasharray: calc(var(--u) * 4px) calc(var(--u) * 3px); }
+    /* Small nodes cannot show a dashed ring: mains devices are solid and battery devices are hollow with a plain ring. */
+    .compact .node-shape.mains { fill: var(--primary-text-color, CanvasText); }
+    .compact .node-shape.battery { stroke-dasharray: none; }
     .node-text { fill: var(--primary-text-color, CanvasText); pointer-events: none; text-anchor: middle; }
     .label {
       position: absolute; transform: translate(-50%, -100%); white-space: nowrap; pointer-events: none;
@@ -345,7 +348,7 @@ export class ZhaNetworkGraphCard extends LitElement {
     const byId = new Map(graph.nodes.map((node) => [node.id, node]));
     return html`
       <div class="graph-wrap">
-      <svg class="graph" style=${`--u: ${String(1 / Math.max(this.frame.scale, 0.05))};${this.maxGraphHeight === undefined ? "" : ` max-height: ${String(this.maxGraphHeight)}px`}`} viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
+      <svg class=${this.plan.inside ? "graph" : "graph compact"} style=${`--u: ${String(1 / Math.max(this.frame.scale, 0.05))};${this.maxGraphHeight === undefined ? "" : ` max-height: ${String(this.maxGraphHeight)}px`}`} viewBox="0 0 ${size.width} ${size.height}" role="group" aria-label="ZHA network graph" @click=${() => { this.selected = undefined; }}>
         ${graph.links.map((link) => {
           const from = positions.get(link.source);
           const to = positions.get(link.target);
@@ -438,7 +441,7 @@ export class ZhaNetworkGraphCard extends LitElement {
         </svg>${label}
       </span>`;
     return html`
-      <div class="legend">
+      <div class=${this.plan.inside ? "legend" : "legend compact"}>
         <span class="legend-item">Weak <span class="scale" role="img" aria-label="Link quality from weak, red, to strong, green"></span> Strong</span>
         ${key("coordinator", false, "Coordinator")}
         ${key("router", false, "Mains powered")}
