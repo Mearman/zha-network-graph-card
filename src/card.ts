@@ -48,6 +48,7 @@ export class ZhaNetworkGraphCard extends LitElement {
     .detail { margin-top: 12px; font-size: 0.9em; }
     .detail ul { margin: 6px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 2px 28px; }
     .detail li { display: flex; justify-content: space-between; gap: 12px; }
+    .detail li span:last-child { white-space: nowrap; }
     .error { color: var(--error-color, #db4437); margin-bottom: 8px; }
     button { cursor: pointer; }
   `;
