@@ -6,6 +6,7 @@ A Lovelace card that draws a [ZHA](https://www.home-assistant.io/integrations/zh
 
 - **Nodes:** the coordinator is the largest circle, routers are filled, and battery-powered devices are hollow. A device that is unavailable is dimmed. Click a node for its role, LQI and RSSI.
 - **Links:** one line per pair of devices, shaded from red (LQI 0) to green (LQI 255). Zigbee neighbour tables are directional, so a link reported by both ends shows the mean of the two values.
+- **Layout:** a stronger link is drawn shorter, so devices with a good connection sit close together. The card runs many force simulations from different seeded starting points and keeps the one with the fewest crossing links, then the one whose lengths best match the signal. Crossing minimisation is NP-hard, so this is a search, not a guarantee of the minimum, and the same data always draws the same picture. Nodes never overlap: the drawing is scaled until every pair keeps its drawn size plus a gap apart, and the view grows if it has to. Devices that appear in no link are drawn in a row below the mesh.
 - **Rescan:** ZHA stores the last neighbour scan. The Rescan button asks ZHA to re-read every device's neighbour table, which can take a while on a large network.
 
 The card reads the same `zha/devices` and `zha/topology/update` websocket commands that ZHA's own Visualization page uses, so it needs no extra integration.

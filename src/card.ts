@@ -1,10 +1,10 @@
 import { LitElement, css, html, nothing, svg } from "lit";
 import { state } from "lit/decorators.js";
-import { forceCenter, forceLink, forceManyBody, forceSimulation } from "d3-force";
-import type { SimulationLinkDatum, SimulationNodeDatum } from "d3-force";
 import { z } from "zod";
-import { MAX_LQI, buildGraph, deviceListSchema, lqiColour } from "./graph";
-import type { Graph, GraphLink, GraphNode } from "./graph";
+import { buildGraph, deviceListSchema, lqiColour } from "./graph";
+import type { Graph, GraphNode } from "./graph";
+import { NODE_RADIUS, layoutGraph } from "./layout";
+import type { Placement } from "./layout";
 
 const configSchema = z.object({
   type: z.string(),
@@ -12,36 +12,12 @@ const configSchema = z.object({
 });
 type CardConfig = z.infer<typeof configSchema>;
 
+const WIDTH = 640;
+const HEIGHT = 480;
+
 /** The part of Home Assistant's frontend `hass` object this card uses. */
 interface Hass {
   callWS(message: { type: string }): Promise<unknown>;
-}
-
-type PositionedNode = GraphNode & SimulationNodeDatum;
-type PositionedLink = SimulationLinkDatum<PositionedNode> & GraphLink;
-
-const WIDTH = 640;
-const HEIGHT = 480;
-/** Enough ticks for d3's default cooling schedule to settle, so the layout is stable between renders. */
-const LAYOUT_TICKS = 300;
-const NODE_RADIUS = { coordinator: 12, router: 8, "end-device": 5 } as const;
-
-/** Lays the graph out once, synchronously. Strong links pull their ends closer together. */
-function layout(graph: Graph): { nodes: PositionedNode[]; links: PositionedLink[] } {
-  const nodes: PositionedNode[] = graph.nodes.map((node) => ({ ...node }));
-  const links: PositionedLink[] = graph.links.map((link) => ({ ...link }));
-  forceSimulation(nodes)
-    .force(
-      "link",
-      forceLink<PositionedNode, PositionedLink>(links)
-        .id((node) => node.id)
-        .distance((link) => 40 + (MAX_LQI - link.lqi) * 0.5),
-    )
-    .force("charge", forceManyBody().strength(-140))
-    .force("centre", forceCenter(WIDTH / 2, HEIGHT / 2))
-    .stop()
-    .tick(LAYOUT_TICKS);
-  return { nodes, links };
 }
 
 export class ZhaNetworkGraphCard extends LitElement {
@@ -58,11 +34,15 @@ export class ZhaNetworkGraphCard extends LitElement {
 
   @state() private config: CardConfig | undefined;
   @state() private graph: Graph | undefined;
+  /** Laid out once per data load, because searching many starts is too slow to repeat on every render. */
+  @state() private placement: Placement | undefined;
   @state() private selected: string | undefined;
   @state() private error: string | undefined;
   @state() private scanning = false;
 
   private hassObject: Hass | undefined;
+  /** Incremented per load so a slow layout from an earlier load cannot overwrite a newer one. */
+  private loadId = 0;
 
   set hass(hass: Hass) {
     const first = this.hassObject === undefined;
@@ -90,7 +70,15 @@ export class ZhaNetworkGraphCard extends LitElement {
     }
     try {
       const devices = deviceListSchema.parse(await this.hassObject.callWS({ type: "zha/devices" }));
-      this.graph = buildGraph(devices);
+      const graph = buildGraph(devices);
+      this.loadId += 1;
+      const loadId = this.loadId;
+      const placement = await layoutGraph(graph, { width: WIDTH, height: HEIGHT });
+      if (loadId !== this.loadId) {
+        return;
+      }
+      this.placement = placement;
+      this.graph = graph;
       this.error = undefined;
     } catch (cause) {
       this.error = cause instanceof Error ? cause.message : String(cause);
@@ -114,8 +102,7 @@ export class ZhaNetworkGraphCard extends LitElement {
   }
 
   override render() {
-    const positioned = this.graph === undefined ? undefined : layout(this.graph);
-    const selected = positioned?.nodes.find((node) => node.id === this.selected);
+    const selected = this.graph?.nodes.find((node) => node.id === this.selected);
     return html`
       <ha-card>
         <div class="toolbar">
@@ -125,33 +112,36 @@ export class ZhaNetworkGraphCard extends LitElement {
           </button>
         </div>
         ${this.error === undefined ? nothing : html`<div class="error">${this.error}</div>`}
-        ${positioned === undefined ? nothing : this.renderGraph(positioned)}
+        ${this.graph === undefined || this.placement === undefined ? nothing : this.renderGraph(this.graph, this.placement)}
         ${selected === undefined ? nothing : this.renderDetail(selected)}
       </ha-card>
     `;
   }
 
-  private renderGraph({ nodes, links }: { nodes: PositionedNode[]; links: PositionedLink[] }) {
-    const at = (end: PositionedLink["source"]): PositionedNode =>
-      end as PositionedNode;
+  private renderGraph(graph: Graph, { positions, size }: Placement) {
     return html`
-      <svg viewBox="0 0 ${WIDTH} ${HEIGHT}" role="img" aria-label="ZHA network graph">
-        ${links.map((link) =>
-          svg`<line
-            x1=${at(link.source).x ?? 0} y1=${at(link.source).y ?? 0}
-            x2=${at(link.target).x ?? 0} y2=${at(link.target).y ?? 0}
-            stroke=${lqiColour(link.lqi)} stroke-width="2" />`,
-        )}
-        ${nodes.map(
-          (node) => svg`<circle
-            cx=${node.x ?? 0} cy=${node.y ?? 0} r=${NODE_RADIUS[node.role]}
-            fill=${node.battery ? "none" : "var(--primary-text-color, #333)"}
-            stroke="var(--primary-text-color, #333)" stroke-width="2"
-            opacity=${node.available ? 1 : 0.35}
-            @click=${() => { this.selected = node.id; }}>
-            <title>${node.name}</title>
-          </circle>`,
-        )}
+      <svg viewBox="0 0 ${size.width} ${size.height}" role="img" aria-label="ZHA network graph">
+        ${graph.links.map((link) => {
+          const from = positions.get(link.source);
+          const to = positions.get(link.target);
+          return from === undefined || to === undefined
+            ? nothing
+            : svg`<line x1=${from.x} y1=${from.y} x2=${to.x} y2=${to.y}
+                stroke=${lqiColour(link.lqi)} stroke-width="2" />`;
+        })}
+        ${graph.nodes.map((node) => {
+          const at = positions.get(node.id);
+          return at === undefined
+            ? nothing
+            : svg`<circle
+                cx=${at.x} cy=${at.y} r=${NODE_RADIUS[node.role]}
+                fill=${node.battery ? "none" : "var(--primary-text-color, currentColor)"}
+                stroke="var(--primary-text-color, currentColor)" stroke-width="2"
+                opacity=${node.available ? 1 : 0.35}
+                @click=${() => { this.selected = node.id; }}>
+                <title>${node.name}</title>
+              </circle>`;
+        })}
       </svg>
     `;
   }
