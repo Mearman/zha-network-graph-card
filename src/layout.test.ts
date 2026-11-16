@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Graph, GraphNode } from "./graph";
-import { EDGE_CLEARANCE, MAX_LENGTH, MIN_LENGTH, NODE_GAP, NODE_RADIUS, countCrossings, countEdgeHits, idealLength, layoutGraph } from "./layout";
+import { ANNEAL_WORK_BUDGET, DEFAULT_REFINE_STEPS, EDGE_CLEARANCE, MAX_LENGTH, MIN_LENGTH, NODE_GAP, NODE_RADIUS, annealStepCost, countCrossings, countEdgeHits, idealLength, layoutGraph, stepsWithinBudget } from "./layout";
 import type { Placement } from "./layout";
 
 const SIZE = { width: 640, height: 480 };
@@ -307,5 +307,29 @@ describe("layoutGraph", () => {
       const radius = new Map(graph.nodes.map((n) => [n.id, NODE_RADIUS[n.role]]));
       expect(countEdgeHits(placement.positions, graph.links, radius)).toBe(0);
     });
+  });
+});
+
+describe("annealing work budget", () => {
+  // A step re-examines the links at one node against every other link and every node against those links, so its
+  // cost grows with the square of the network. A fixed step count therefore took minutes on a mesh of a few
+  // dozen devices and froze the page; the step count is derived from a work budget instead.
+  it("keeps the requested steps on a small network", () => {
+    expect(stepsWithinBudget(12, 20, DEFAULT_REFINE_STEPS)).toBe(DEFAULT_REFINE_STEPS);
+  });
+
+  it.each([
+    [59, 274],
+    [120, 700],
+    [400, 3000],
+  ])("keeps the work of one pass on %i devices and %i links within the budget", (nodes, links) => {
+    const steps = stepsWithinBudget(nodes, links, DEFAULT_REFINE_STEPS);
+    expect(steps).toBeLessThan(DEFAULT_REFINE_STEPS);
+    expect(steps * annealStepCost(nodes, links)).toBeLessThanOrEqual(ANNEAL_WORK_BUDGET);
+  });
+
+  it("never asks for more than was requested and never for a negative count", () => {
+    expect(stepsWithinBudget(59, 274, 10)).toBe(10);
+    expect(stepsWithinBudget(5000, 100000, DEFAULT_REFINE_STEPS)).toBeGreaterThanOrEqual(0);
   });
 });
