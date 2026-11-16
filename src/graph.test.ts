@@ -47,6 +47,18 @@ describe("buildGraph", () => {
     });
   });
 
+  // Every `device_type` string the zha library can emit: the three zigpy `LogicalType` names, the fixed "GreenPower" of a Green Power device, and the "unknown" of a device with no node descriptor. A device with any of these must be drawn, never fail the whole card.
+  it.each([
+    ["Coordinator", "coordinator"],
+    ["Router", "router"],
+    ["EndDevice", "end-device"],
+    ["GreenPower", "end-device"],
+    ["unknown", "end-device"],
+  ] as const)("draws a %s device as a %s", (deviceType, role) => {
+    const devices = deviceListSchema.parse([{ ...sensor, device_type: deviceType }]);
+    expect(buildGraph(devices).nodes[0]).toMatchObject({ role });
+  });
+
   it("rejects an unknown device type instead of guessing a role", () => {
     const unknown = deviceListSchema.parse([{ ...sensor, device_type: "Mystery" }]);
     expect(() => buildGraph(unknown)).toThrow("Mystery");
