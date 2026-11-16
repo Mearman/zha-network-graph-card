@@ -42,6 +42,28 @@ const TICKS = 400;
 export const REFINED_CANDIDATES = 3;
 /** Moves tried per annealed candidate. */
 export const DEFAULT_REFINE_STEPS = 100000;
+
+/**
+ * Link-pair and node-link tests one annealing pass may perform. A pass runs without yielding, so this bounds how long
+ * it can hold the page; networks small enough to fit keep the full step count.
+ */
+export const ANNEAL_WORK_BUDGET = 4e7;
+
+/**
+ * The tests one annealing step performs on average, before and after the move: the links at the moved node against
+ * every link, plus every link against the node and every node against the links at the moved node. A node has
+ * `2 * links / nodes` links on average.
+ */
+export function annealStepCost(nodes: number, links: number): number {
+  const perNode = nodes === 0 ? 0 : (2 * links) / nodes;
+  return 2 * (perNode * links + links + perNode * nodes);
+}
+
+/** The annealing steps to run: the requested count, cut to what ANNEAL_WORK_BUDGET allows for a network of this size. */
+export function stepsWithinBudget(nodes: number, links: number, requested: number): number {
+  const cost = annealStepCost(nodes, links);
+  return cost === 0 ? requested : Math.min(requested, Math.floor(ANNEAL_WORK_BUDGET / cost));
+}
 /** What one crossing costs the annealer, in the squared length error of links: about a 45 unit error. */
 const CROSSING_COST = 2000;
 /** A moved node may not come closer than this to another node, so annealing cannot pile nodes together. */
@@ -311,6 +333,7 @@ function anneal(
       ideal.push(idealLength(link.lqi, maxLength));
     }
   }
+  const budgeted = stepsWithinBudget(ids.length, ends.length, steps);
   const x = (index: number): number => xs[index] ?? 0;
   const y = (index: number): number => ys[index] ?? 0;
   const side = (a: number, b: number, c: number): number => Math.sign((x(b) - x(a)) * (y(c) - y(a)) - (y(b) - y(a)) * (x(c) - x(a)));
@@ -377,8 +400,8 @@ function anneal(
   const random = seededRandom(seed);
   const hot = CROSSING_COST;
   const cold = 2;
-  for (let step = 0; step < steps; step += 1) {
-    const progress = step / steps;
+  for (let step = 0; step < budgeted; step += 1) {
+    const progress = step / budgeted;
     const temperature = hot * (cold / hot) ** progress;
     const reach = MIN_LENGTH + maxLength * 0.5 * (1 - progress);
     const node = Math.floor(random() * ids.length);
