@@ -47,10 +47,15 @@ export interface Graph {
 /** LQI is a one byte quality figure reported by the radio, 0 (unusable) to 255. */
 export const MAX_LQI = 255;
 
+/**
+ * Every `device_type` the zha library reports: the zigpy `LogicalType` names, "GreenPower" for a Green Power device (batteryless, never routes) and "unknown" for a device with no node descriptor yet (not shown to route, so drawn as an end device).
+ */
 const ROLES: Readonly<Record<string, Role>> = {
   Coordinator: "coordinator",
   Router: "router",
   EndDevice: "end-device",
+  GreenPower: "end-device",
+  unknown: "end-device",
 };
 
 function roleOf(deviceType: string): Role {
